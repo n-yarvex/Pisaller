@@ -71,7 +71,7 @@ func main() {
         log.Printf("[ECH] 初始化失败: %v", err)
     }
 
-    go runSocks5(conf.LocalSocks5)
+    go runSOCKS5(conf.LocalSocks5)
     if conf.LocalHTTP != "" {
         go runHTTP(conf.LocalHTTP)
     }
