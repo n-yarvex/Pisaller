@@ -1,7 +1,7 @@
 package transport
 
 import (
-    "base64"
+    "encoding/base64"
     "encoding/binary"
     "fmt"
     "io"
