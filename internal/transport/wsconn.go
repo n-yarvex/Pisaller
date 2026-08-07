@@ -3,6 +3,7 @@ package transport
 import (
 	"errors"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -57,6 +58,8 @@ func (c *WSNetConn) signalDead(err error) {
 	c.deadMu.Lock()
 	if c.deadErr == nil {
 		c.deadErr = err
+	} else {
+		log.Printf("[WSNetConn] additional dead error: %v", err)
 	}
 	c.deadMu.Unlock()
 	c.deadOnce.Do(func() {
@@ -127,7 +130,6 @@ func (c *WSNetConn) Write(p []byte) (int, error) {
 		if len(p) >= c.upPack {
 			return c.writeDirect(p)
 		}
-		// 如果 flush 后仍然超过 maxQueue，直接发送
 		if len(p) > c.maxQueue {
 			return c.writeDirect(p)
 		}
@@ -142,7 +144,10 @@ func (c *WSNetConn) Write(p []byte) (int, error) {
 		if err := c.flushLocked(); err != nil {
 			return 0, err
 		}
-	} else if c.timer == nil && c.chunkMs > 0 {
+	} else if c.chunkMs > 0 {
+		if c.timer != nil {
+			c.timer.Stop()
+		}
 		c.timer = time.AfterFunc(time.Duration(c.chunkMs)*time.Millisecond, func() {
 			c.upMu.Lock()
 			defer c.upMu.Unlock()
@@ -191,12 +196,11 @@ func (c *WSNetConn) flushLocked() error {
 	c.upQueue = nil
 	c.upSize = 0
 
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if c.isClosed() {
 		return net.ErrClosed
 	}
-
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	w, err := c.ws.NextWriter(websocket.BinaryMessage)
 	if err != nil {
 		c.signalDead(err)
@@ -222,6 +226,7 @@ func (c *WSNetConn) Close() error {
 	c.upMu.Lock()
 	if err := c.flushLocked(); err != nil {
 		c.upMu.Unlock()
+		log.Printf("[WSNetConn] flush on close error: %v", err)
 		c.signalDead(err)
 	} else {
 		c.upMu.Unlock()
@@ -257,7 +262,10 @@ func (c *WSNetConn) SetDeadline(t time.Time) error {
 	if err := c.ws.SetReadDeadline(t); err != nil {
 		return err
 	}
-	return c.ws.SetWriteDeadline(t)
+	if err := c.ws.SetWriteDeadline(t); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c *WSNetConn) SetReadDeadline(t time.Time) error {
