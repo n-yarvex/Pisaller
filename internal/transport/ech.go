@@ -22,16 +22,17 @@ var (
 	echFallback bool
 	echDomain   string
 	dnsServer   string
+	dohClient   = &http.Client{Timeout: 3 * time.Second}
 )
 
 func InitECH(dns, domain string, fallback bool) error {
 	echFallback = fallback
-	echDomain = domain
-	dnsServer = dns
 	if fallback {
 		log.Println("[ECH] Fallback 模式，禁用 ECH")
 		return nil
 	}
+	echDomain = domain
+	dnsServer = dns
 	return RefreshECH()
 }
 
@@ -77,7 +78,9 @@ func queryDNSUDP(domain, dnsServer string) ([]byte, error) {
 		return nil, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return nil, err
+	}
 	if _, err = conn.Write(query); err != nil {
 		return nil, err
 	}
@@ -104,8 +107,7 @@ func queryDoH(domain, dohURL string) ([]byte, error) {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/dns-message")
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := dohClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -141,16 +143,33 @@ func parseDNSResponse(response []byte) ([]byte, error) {
 		return nil, fmt.Errorf("无答案记录")
 	}
 	offset := 12
-	for offset < len(response) && response[offset] != 0 {
+	for offset < len(response) {
+		if response[offset] == 0 {
+			offset++
+			break
+		}
+		if response[offset]&0xC0 == 0xC0 {
+			if offset+2 > len(response) {
+				return nil, fmt.Errorf("QNAME 压缩指针越界")
+			}
+			ptrOffset := int(binary.BigEndian.Uint16(response[offset:offset+2]) & 0x3FFF)
+			if ptrOffset >= len(response) {
+				return nil, fmt.Errorf("无效的DNS压缩指针")
+			}
+			offset += 2
+			break
+		}
 		offset += int(response[offset]) + 1
 	}
-	offset += 5
+	if offset+4 > len(response) {
+		return nil, fmt.Errorf("QTYPE/QCLASS 越界")
+	}
+	offset += 4
 	for i := 0; i < int(ancount); i++ {
 		if offset >= len(response) {
 			break
 		}
 		if response[offset]&0xC0 == 0xC0 {
-			// 验证压缩指针指向的位置
 			if offset+2 > len(response) {
 				break
 			}
