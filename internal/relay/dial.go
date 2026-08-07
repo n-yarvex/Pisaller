@@ -3,6 +3,7 @@ package relay
 import (
     "context"
     "fmt"
+    "log"
     "net"
     "sync"
     "time"
@@ -11,6 +12,12 @@ import (
 )
 
 func DialTCPWithRace(addr string, strategy byte, concur int, timeout time.Duration) (net.Conn, error) {
+    if concur <= 0 {
+        return nil, fmt.Errorf("concur must be > 0")
+    }
+    if timeout <= 0 {
+        return nil, fmt.Errorf("timeout must be > 0")
+    }
     if concur <= 1 {
         return DialTCPWithStrategy(addr, strategy, timeout)
     }
@@ -40,6 +47,7 @@ func DialTCPWithRace(addr string, strategy byte, concur int, timeout time.Durati
             dialer := net.Dialer{Timeout: timeout}
             conn, err := dialer.DialContext(ctx, "tcp", target)
             if err != nil {
+                log.Printf("dial %s error: %v", target, err)
                 return
             }
             select {
@@ -55,22 +63,34 @@ func DialTCPWithRace(addr string, strategy byte, concur int, timeout time.Durati
         close(resultCh)
     }()
 
-    select {
-    case conn := <-resultCh:
-        cancel()
-        go func() {
-            for range resultCh {
-            }
-        }()
-        return conn, nil
-    case <-time.After(timeout):
-        cancel()
-        return nil, fmt.Errorf("all connection attempts timed out")
+    var winner net.Conn
+    for conn := range resultCh {
+        if winner == nil {
+            winner = conn
+            cancel()
+        } else {
+            conn.Close()
+        }
     }
+
+    if winner != nil {
+        return winner, nil
+    }
+    return nil, fmt.Errorf("all connection attempts failed")
 }
 
 func resolveIPsForDial(host string, strategy byte, timeout time.Duration) []net.IP {
     if ip := net.ParseIP(host); ip != nil {
+        switch strategy {
+        case constants.IPStrategyIPv4Only:
+            if ip.To4() == nil {
+                return nil
+            }
+        case constants.IPStrategyIPv6Only:
+            if ip.To4() != nil {
+                return nil
+            }
+        }
         return []net.IP{ip}
     }
 
@@ -157,6 +177,7 @@ func DialTCPWithStrategy(addr string, strategy byte, timeout time.Duration) (net
             if err == nil {
                 return conn, nil
             }
+            log.Printf("dial %s error: %v", target, err)
         }
         return nil, fmt.Errorf("no reachable IP for %s", host)
     }
