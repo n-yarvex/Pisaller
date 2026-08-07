@@ -2,6 +2,7 @@ package protocol
 
 import (
     "encoding/binary"
+    "fmt"
     "io"
     "net"
 
@@ -34,7 +35,7 @@ func ReadChunk(stream *smux.Stream) ([]byte, error) {
         return nil, err
     }
     if size == 0 {
-        return []byte{}, nil
+        return nil, nil
     }
     data := make([]byte, size)
     if _, err := io.ReadFull(stream, data); err != nil {
@@ -46,7 +47,7 @@ func ReadChunk(stream *smux.Stream) ([]byte, error) {
 func WriteUDPReply(stream *smux.Stream, addr string, data []byte) error {
     addrBytes := []byte(addr)
     if len(addrBytes) > 65535 {
-        addrBytes = addrBytes[:65535]
+        return fmt.Errorf("addr too long: %d", len(addrBytes))
     }
     buf := make([]byte, 2+len(addrBytes)+len(data))
     binary.BigEndian.PutUint16(buf[0:2], uint16(len(addrBytes)))
@@ -59,7 +60,7 @@ func WriteUDPReply(stream *smux.Stream, addr string, data []byte) error {
 func WriteUDPChunk(stream *smux.Stream, addr string, data []byte) error {
     addrBytes := []byte(addr)
     if len(addrBytes) > 65535 {
-        addrBytes = addrBytes[:65535]
+        return fmt.Errorf("addr too long: %d", len(addrBytes))
     }
     buf := make([]byte, 2+2+len(addrBytes)+len(data))
     binary.BigEndian.PutUint16(buf[0:2], uint16(len(addrBytes)))
