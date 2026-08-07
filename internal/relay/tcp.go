@@ -2,9 +2,10 @@ package relay
 
 import (
 	"context"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/xtaci/smux"
@@ -13,7 +14,6 @@ import (
 	"proxy/internal/pool"
 	"proxy/internal/protocol"
 	"proxy/internal/session"
-	"proxy/internal/transport"
 )
 
 func HandleSmuxStream(sess *session.ClientSession, ch *session.WSChannel, stream *smux.Stream, cfg *Config) {
@@ -36,7 +36,7 @@ func HandleSmuxStream(sess *session.ClientSession, ch *session.WSChannel, stream
 		handleTCPStream(stream, target, strategy, cfg)
 
 	case constants.StreamKindUDP:
-		handleUDPStream(stream, strategy, cfg)
+		handleUDPStream(stream, target, strategy, cfg)
 	}
 }
 
@@ -44,7 +44,7 @@ func handleTCPStream(stream *smux.Stream, target string, strategy byte, cfg *Con
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	dataCh := make(chan []byte, 256)
+	dataCh := make(chan []byte, 1024)
 	errCh := make(chan error, 2)
 
 	// 读取 goroutine
@@ -99,6 +99,7 @@ func handleTCPStream(stream *smux.Stream, target string, strategy byte, cfg *Con
 			return
 		}
 	case <-time.After(cfg.DialTimeout):
+		cancel()
 		return
 	}
 
@@ -140,7 +141,7 @@ func handleTCPStream(stream *smux.Stream, target string, strategy byte, cfg *Con
 	}
 }
 
-func handleUDPStream(stream *smux.Stream, strategy byte, cfg *Config) {
+func handleUDPStream(stream *smux.Stream, target string, strategy byte, cfg *Config) {
 	relay, err := NewDirectUDPRelayer()
 	if err != nil {
 		return
@@ -149,6 +150,12 @@ func handleUDPStream(stream *smux.Stream, strategy byte, cfg *Config) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// 解析初始目标地址
+	udpAddr, err := resolveUDPAddr(target, strategy, cfg.DialTimeout)
+	if err != nil {
+		return
+	}
 
 	// stream -> UDP
 	go func() {
@@ -161,38 +168,18 @@ func handleUDPStream(stream *smux.Stream, strategy byte, cfg *Config) {
 			if len(data) == 0 {
 				continue
 			}
-			// 获取目标地址从 stream 的初始 target（已在 header 中）
-			// UDP 数据直接使用，不需要额外的 addr 包装
-			// 这里使用 readChunk 读取纯数据
-		}
-	}()
-
-	// 实际上 UDP 需要 addr 信息，使用 protocol.ReadUDPChunk
-	// 但客户端发送的是 writeChunk 格式（纯数据）
-	// 需要与客户端协商一致
-
-	// stream -> UDP (修正后使用 readChunk 匹配客户端的 writeChunk)
-	go func() {
-		defer cancel()
-		for {
-			data, err := readChunk(stream)
-			if err != nil {
+			if _, err := relay.WriteTo(data, udpAddr); err != nil {
 				return
 			}
-			if len(data) == 0 {
-				continue
-			}
-			// UDP 需要目标地址，但客户端没有发送
-			// 这是一个设计问题，需要重新考虑协议
 		}
 	}()
 
-	bufPtr := pool.BufPool.Get().(*[]byte)
-	buf := *bufPtr
+	bufPtr := pool.BufPool.Get().([]byte)
+	buf := bufPtr
 	defer pool.BufPool.Put(bufPtr)
 
 	for {
-		relay.SetReadDeadline(time.Now().Add(1 * time.Second))
+		relay.SetReadDeadline(time.Now().Add(5 * time.Second))
 		n, addr, err := relay.Read(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -205,7 +192,6 @@ func handleUDPStream(stream *smux.Stream, strategy byte, cfg *Config) {
 			}
 			return
 		}
-		// 使用 writeUDPReply 格式发送，与客户端 readUDPReply 匹配
 		if err := writeUDPReply(stream, addr.String(), buf[:n]); err != nil {
 			return
 		}
