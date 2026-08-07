@@ -1,3 +1,4 @@
+
 package main
 
 import (
@@ -71,13 +72,27 @@ func main() {
 		log.Printf("[ECH] 初始化失败: %v", err)
 	}
 
-	go runSOCKS5(conf.LocalSocks5)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runSOCKS5(conf.LocalSocks5)
+	}()
 	if conf.LocalHTTP != "" {
-		go runHTTP(conf.LocalHTTP)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runHTTP(conf.LocalHTTP)
+		}()
 	}
 
 	startPool()
-	connectLoop()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		connectLoop()
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -86,6 +101,7 @@ func main() {
 	if sess != nil {
 		sess.Close()
 	}
+	wg.Wait()
 }
 
 func startPool() {
@@ -110,7 +126,7 @@ func (p *ECHPool) dialAndServe(idx int, ip string) {
 		ipLabel = "自动解析"
 	}
 	for {
-		wsConn, err := dialWS(p.wsServerAddr, ip, p.clientID, chID)
+		wsConn, err := dialWS(context.Background(), p.wsServerAddr, ip, p.clientID, chID)
 		if err != nil {
 			log.Printf("[客户端] 通道 %d (IP:%s) 连接失败: %v", chID, ipLabel, err)
 			time.Sleep(3 * time.Second)
@@ -126,11 +142,11 @@ func (p *ECHPool) dialAndServe(idx int, ip string) {
 		}
 		p.wsConnsMu.Lock()
 		p.smuxConns[idx] = sess
-		p.channelRTT[idx] = 0
+		atomic.StoreInt64(&p.channelRTT[idx], 0)
 		p.wsConnsMu.Unlock()
 		log.Printf("[客户端] 通道 %d (IP:%s) 就绪", chID, ipLabel)
 		if rtt, err := p.probeChannelRTTOnce(sess, conf.DialTimeout); err == nil {
-			p.channelRTT[idx] = rtt
+			atomic.StoreInt64(&p.channelRTT[idx], rtt)
 		}
 
 		done := make(chan error, 1)
@@ -152,7 +168,7 @@ func (p *ECHPool) dialAndServe(idx int, ip string) {
 
 		p.wsConnsMu.Lock()
 		p.smuxConns[idx] = nil
-		p.channelRTT[idx] = 0
+		atomic.StoreInt64(&p.channelRTT[idx], 0)
 		p.wsConnsMu.Unlock()
 		if probeErr != nil {
 			log.Printf("[客户端] 通道 %d 断开原因: %v", chID, probeErr)
@@ -173,7 +189,7 @@ func (p *ECHPool) probeChannelRTT(sess *smux.Session, idx int, done chan error) 
 	for {
 		rtt, err := p.probeChannelRTTOnce(sess, conf.DialTimeout)
 		if err != nil {
-			p.channelRTT[idx] = int64(conf.DialTimeout.Nanoseconds())
+			atomic.StoreInt64(&p.channelRTT[idx], int64(conf.DialTimeout.Nanoseconds()))
 			if sess.IsClosed() {
 				exitErr = err
 				return
@@ -181,7 +197,7 @@ func (p *ECHPool) probeChannelRTT(sess *smux.Session, idx int, done chan error) 
 			<-ticker.C
 			continue
 		}
-		p.channelRTT[idx] = rtt
+		atomic.StoreInt64(&p.channelRTT[idx], rtt)
 		<-ticker.C
 	}
 }
@@ -223,7 +239,7 @@ func (p *ECHPool) openBestStream() (*smux.Stream, int, int, error) {
 		if sess == nil || sess.IsClosed() {
 			continue
 		}
-		rtt := p.channelRTT[i]
+		rtt := atomic.LoadInt64(&p.channelRTT[i])
 		if rtt <= 0 {
 			rtt = int64(conf.DialTimeout.Nanoseconds())
 		}
@@ -305,7 +321,7 @@ func writeSmuxOpenHeader(w io.Writer, kind byte, strategy byte, target string) e
 }
 
 func writeChunk(w io.Writer, b []byte) error {
-	if len(b) > 65535 {
+	if len(b) >= 65536 {
 		return fmt.Errorf("数据块过大")
 	}
 	h := make([]byte, 2)
@@ -327,7 +343,7 @@ func readChunk(r io.Reader) ([]byte, error) {
 	}
 	n := int(binary.BigEndian.Uint16(h))
 	if n == 0 {
-		return nil, nil
+		return []byte{}, nil
 	}
 	b := make([]byte, n)
 	_, err := io.ReadFull(r, b)
@@ -379,7 +395,7 @@ func readUDPReply(r io.Reader) (string, []byte, error) {
 	return string(addrRaw), data, nil
 }
 
-func dialWS(addr string, ip string, clientID string, channelID int) (*websocket.Conn, error) {
+func dialWS(ctx context.Context, addr string, ip string, clientID string, channelID int) (*websocket.Conn, error) {
 	u, err := url.Parse(addr)
 	if err != nil {
 		return nil, err
@@ -430,7 +446,7 @@ func dialWS(addr string, ip string, clientID string, channelID int) (*websocket.
 		u.Scheme = "ws"
 		dialAddr = u.String()
 
-		dialer.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialer.NetDialContext = func(ctx2 context.Context, network, address string) (net.Conn, error) {
 			host, port, _ := net.SplitHostPort(address)
 			if ip != "" {
 				host = ip
@@ -443,13 +459,15 @@ func dialWS(addr string, ip string, clientID string, channelID int) (*websocket.
 			}
 			uConn := utls.UClient(tcpConn, utlsConfig, *clientHelloID)
 			if err := uConn.Handshake(); err != nil {
-				_ = tcpConn.Close()
+				if closeErr := tcpConn.Close(); closeErr != nil {
+					log.Printf("[dialWS] tcpConn.Close() error: %v", closeErr)
+				}
 				return nil, err
 			}
 			return uConn, nil
 		}
 
-		conn, resp, err := dialer.Dial(dialAddr, nil)
+		conn, resp, err := dialer.DialContext(ctx, dialAddr, nil)
 		if err != nil {
 			if resp != nil && resp.StatusCode == http.StatusUnauthorized {
 				return nil, fmt.Errorf("认证失败：Token 不匹配")
@@ -459,7 +477,7 @@ func dialWS(addr string, ip string, clientID string, channelID int) (*websocket.
 		return conn, nil
 	}
 
-	return dialer.Dial(dialAddr, nil)
+	return dialer.DialContext(ctx, dialAddr, nil)
 }
 
 func connectLoop() {
@@ -473,7 +491,7 @@ func connectLoop() {
 			time.Sleep(1 * time.Second)
 			continue
 		}
-		wsConn, err := dialWS(conf.ServerAddr, "", conf.UUID, 0)
+		wsConn, err := dialWS(context.Background(), conf.ServerAddr, "", conf.UUID, 0)
 		if err != nil {
 			log.Printf("[客户端] 主连接失败: %v", err)
 			time.Sleep(5 * time.Second)
@@ -538,8 +556,12 @@ func keepAlive(sess *session.ClientSession) {
 				return
 			}
 			header := []byte{constants.StreamKindPing, 0, 0, 0}
-			_, _ = stream.Write(header)
-			_, _ = stream.Write(make([]byte, 8))
+			if _, err := stream.Write(header); err != nil {
+				log.Printf("[keepAlive] stream.Write error: %v", err)
+			}
+			if _, err := stream.Write(make([]byte, 8)); err != nil {
+				log.Printf("[keepAlive] stream.Write error: %v", err)
+			}
 			_ = stream.Close()
 		case <-sess.Done():
 			return
@@ -595,61 +617,6 @@ func logClientConnEvent(c net.Conn, reqType, target string, chID int, opened boo
 	log.Printf("[客户端] %s %s %s %s 通道 %d", clientSourceAddr(c), reqType, arrow, target, chID)
 }
 
-// ---- TCP Listener ----
-func runTCPListener(rule string) {
-	rule = strings.TrimPrefix(rule, "tcp://")
-	parts := strings.Split(rule, "/")
-	if len(parts) != 2 {
-		return
-	}
-	lAddr, tAddr := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-	l, err := net.Listen("tcp", lAddr)
-	if err != nil {
-		log.Fatalf("[客户端] TCP监听失败: %v", err)
-	}
-	log.Printf("[客户端] TCP转发: %s -> %s", lAddr, tAddr)
-	for {
-		c, err := l.Accept()
-		if err != nil {
-			continue
-		}
-		go handleLocalTCP(c, tAddr)
-	}
-}
-
-func handleLocalTCP(c net.Conn, target string) {
-	stream, chID, decision, err := pool.openTCPStream(target)
-	if err != nil {
-		_ = c.Close()
-		return
-	}
-	logClientConnEvent(c, "TCP转发", target, decision, true)
-	defer logClientConnEvent(c, "TCP转发", target, decision, false)
-	proxyConn(c, stream)
-}
-
-func proxyConn(local net.Conn, remote net.Conn) {
-	var closeOnce sync.Once
-	closeFunc := func() {
-		_ = local.Close()
-		_ = remote.Close()
-	}
-
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(remote, local)
-		closeOnce.Do(closeFunc)
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(local, remote)
-		closeOnce.Do(closeFunc)
-		done <- struct{}{}
-	}()
-	<-done
-	<-done
-}
-
 // ---- SOCKS5 ----
 type ProxyConfig struct {
 	Username, Password, Host string
@@ -703,13 +670,33 @@ func handleSOCKS5(c net.Conn, cfgp *ProxyConfig) {
 		return
 	}
 	methods := make([]byte, buf[1])
-	_, _ = io.ReadFull(c, methods)
+	if _, err := io.ReadFull(c, methods); err != nil {
+		return
+	}
+	hasNoAuth := false
+	hasUserPass := false
+	for _, m := range methods {
+		if m == 0x00 {
+			hasNoAuth = true
+		}
+		if m == 0x02 {
+			hasUserPass = true
+		}
+	}
 	if cfgp.Username != "" {
+		if !hasUserPass {
+			_, _ = c.Write([]byte{0x05, 0xFF})
+			return
+		}
 		_, _ = c.Write([]byte{0x05, 0x02})
 		if err := handleSOCKS5UserPassAuth(c, cfgp); err != nil {
 			return
 		}
 	} else {
+		if !hasNoAuth {
+			_, _ = c.Write([]byte{0x05, 0xFF})
+			return
+		}
 		_, _ = c.Write([]byte{0x05, 0x00})
 	}
 
@@ -744,13 +731,33 @@ func handleSOCKS5(c net.Conn, cfgp *ProxyConfig) {
 	ip := net.ParseIP(host)
 	if conf.IPStrategy == constants.IPStrategyIPv4Only {
 		if head[3] == 0x04 || (ip != nil && ip.To4() == nil) {
-			_, _ = c.Write([]byte{0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			reply := []byte{0x05, 0x02, 0x00, head[3]}
+			if head[3] == 0x01 {
+				reply = append(reply, make([]byte, 4)...)
+				reply = append(reply, 0, 0)
+			} else if head[3] == 0x04 {
+				reply = append(reply, make([]byte, 16)...)
+				reply = append(reply, 0, 0)
+			} else {
+				reply = append(reply, 0, 0, 0, 0, 0, 0)
+			}
+			_, _ = c.Write(reply)
 			return
 		}
 	}
 	if conf.IPStrategy == constants.IPStrategyIPv6Only {
 		if head[3] == 0x01 || (ip != nil && ip.To4() != nil) {
-			_, _ = c.Write([]byte{0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			reply := []byte{0x05, 0x02, 0x00, head[3]}
+			if head[3] == 0x01 {
+				reply = append(reply, make([]byte, 4)...)
+				reply = append(reply, 0, 0)
+			} else if head[3] == 0x04 {
+				reply = append(reply, make([]byte, 16)...)
+				reply = append(reply, 0, 0)
+			} else {
+				reply = append(reply, 0, 0, 0, 0, 0, 0)
+			}
+			_, _ = c.Write(reply)
 			return
 		}
 	}
@@ -767,12 +774,24 @@ func handleSOCKS5(c net.Conn, cfgp *ProxyConfig) {
 
 func handleSOCKS5UserPassAuth(c net.Conn, cfgp *ProxyConfig) error {
 	b := make([]byte, 2)
-	_, _ = io.ReadFull(c, b)
+	if _, err := io.ReadFull(c, b); err != nil {
+		return err
+	}
+	if b[0] != 0x01 {
+		_, _ = c.Write([]byte{0x01, 0x01})
+		return errors.New("不支持的认证版本")
+	}
 	u := make([]byte, b[1])
-	_, _ = io.ReadFull(c, u)
-	_, _ = io.ReadFull(c, b[:1])
+	if _, err := io.ReadFull(c, u); err != nil {
+		return err
+	}
+	if _, err := io.ReadFull(c, b[:1]); err != nil {
+		return err
+	}
 	p := make([]byte, b[0])
-	_, _ = io.ReadFull(c, p)
+	if _, err := io.ReadFull(c, p); err != nil {
+		return err
+	}
 	if string(u) == cfgp.Username && string(p) == cfgp.Password {
 		_, _ = c.Write([]byte{0x01, 0x00})
 		return nil
@@ -857,8 +876,8 @@ type UDPAssociation struct {
 }
 
 func (a *UDPAssociation) loop() {
-	bufPtr := transport.BufPool.Get().(*[]byte)
-	buf := *bufPtr
+	bufPtr := transport.BufPool.Get().([]byte)
+	buf := bufPtr
 	defer transport.BufPool.Put(bufPtr)
 
 	for {
@@ -898,28 +917,25 @@ func (a *UDPAssociation) send(target string, data []byte) {
 		return
 	}
 	needStart := !a.receiving
+	var stream *smux.Stream
+	var id int
+	var decision int
+	var err error
 	if needStart {
 		a.receiving = true
 		a.target = target
-	}
-	stream := a.stream
-	a.mu.Unlock()
-
-	if needStart {
-		s, id, decision, err := a.pool.openUDPStream(target)
+		stream, id, decision, err = a.pool.openUDPStream(target)
 		if err != nil {
+			a.mu.Unlock()
 			a.Close()
 			return
 		}
-		a.mu.Lock()
-		a.stream = s
+		a.stream = stream
 		a.channelID = id
-		stream = s
-		a.mu.Unlock()
 		logClientConnEvent(a.tcpConn, "SOCKS5-UDP", target, decision, true)
 		go func() {
 			for {
-				addrStr, payload, e := readUDPReply(s)
+				addrStr, payload, e := readUDPReply(stream)
 				if e != nil {
 					a.Close()
 					return
@@ -929,11 +945,12 @@ func (a *UDPAssociation) send(target string, data []byte) {
 		}()
 	} else {
 		if target != "" && target != a.target {
-			a.mu.Lock()
 			a.target = target
-			a.mu.Unlock()
 		}
+		stream = a.stream
 	}
+	a.mu.Unlock()
+
 	if stream == nil {
 		a.Close()
 		return
@@ -946,8 +963,15 @@ func (a *UDPAssociation) send(target string, data []byte) {
 func (a *UDPAssociation) handleUDPResponse(addrStr string, data []byte) {
 	host, portStr, _ := net.SplitHostPort(addrStr)
 	port := 0
-	_, _ = fmt.Sscanf(portStr, "%d", &port)
-	pkt, _ := buildSOCKS5UDPPacket(host, port, data)
+	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
+		log.Printf("[UDPAssociation] 解析端口失败: %v", err)
+		return
+	}
+	pkt, err := buildSOCKS5UDPPacket(host, port, data)
+	if err != nil {
+		log.Printf("[UDPAssociation] 构建UDP包失败: %v", err)
+		return
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.clientUDPAddr != nil {
@@ -1025,6 +1049,9 @@ func parseSOCKS5UDPPacket(b []byte) (string, []byte, error) {
 }
 
 func buildSOCKS5UDPPacket(h string, p int, d []byte) ([]byte, error) {
+	if len(h) > 255 {
+		return nil, fmt.Errorf("域名过长: %d", len(h))
+	}
 	buf := []byte{0, 0, 0}
 	ip := net.ParseIP(h)
 	if ip4 := ip.To4(); ip4 != nil {
