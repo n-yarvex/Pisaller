@@ -71,6 +71,9 @@ func (s *ClientSession) Close() {
 		close(s.done)
 		s.smuxSess.Close()
 		s.wsConn.Close()
+		s.mu.Lock()
+		s.channels = nil
+		s.mu.Unlock()
 	})
 }
 
@@ -89,6 +92,14 @@ func NewWSChannel(sess *ClientSession, stream *smux.Stream, id uint32) *WSChanne
 
 func (ch *WSChannel) GetStream() *smux.Stream {
 	return ch.stream
+}
+
+func (ch *WSChannel) GetLocalAddr() net.Addr {
+	return ch.localAddr
+}
+
+func (ch *WSChannel) GetRemoteAddr() net.Addr {
+	return ch.remoteAddr
 }
 
 func (ch *WSChannel) Close() {
