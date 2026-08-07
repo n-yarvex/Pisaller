@@ -1,6 +1,8 @@
 package protocol
 
 import (
+    "errors"
+    "fmt"
     "io"
     "net"
     "time"
@@ -8,7 +10,12 @@ import (
     "proxy/internal/constants"
 )
 
+var ErrInvalidHandshake = errors.New("invalid handshake")
+
 func WriteHandshakeRequest(conn net.Conn, uuid []byte, timeout time.Duration) error {
+    if timeout <= 0 {
+        return fmt.Errorf("timeout must be > 0")
+    }
     conn.SetWriteDeadline(time.Now().Add(timeout))
     defer conn.SetWriteDeadline(time.Time{})
     buf := make([]byte, 1+len(uuid))
@@ -19,6 +26,9 @@ func WriteHandshakeRequest(conn net.Conn, uuid []byte, timeout time.Duration) er
 }
 
 func ReadHandshakeRequest(conn net.Conn, timeout time.Duration) ([]byte, error) {
+    if timeout <= 0 {
+        return nil, fmt.Errorf("timeout must be > 0")
+    }
     conn.SetReadDeadline(time.Now().Add(timeout))
     defer conn.SetReadDeadline(time.Time{})
     var typ [1]byte
@@ -26,7 +36,7 @@ func ReadHandshakeRequest(conn net.Conn, timeout time.Duration) ([]byte, error) 
         return nil, err
     }
     if typ[0] != constants.HandshakeReq {
-        return nil, io.ErrUnexpectedEOF
+        return nil, ErrInvalidHandshake
     }
     uuid := make([]byte, constants.UUIDLength)
     if _, err := io.ReadFull(conn, uuid); err != nil {
@@ -36,14 +46,22 @@ func ReadHandshakeRequest(conn net.Conn, timeout time.Duration) ([]byte, error) 
 }
 
 func WriteHandshakeResponse(conn net.Conn, code byte, timeout time.Duration) error {
+    if timeout <= 0 {
+        return fmt.Errorf("timeout must be > 0")
+    }
     conn.SetWriteDeadline(time.Now().Add(timeout))
     defer conn.SetWriteDeadline(time.Time{})
-    buf := []byte{constants.HandshakeResp, code}
-    _, err := conn.Write(buf)
+    var buf [2]byte
+    buf[0] = constants.HandshakeResp
+    buf[1] = code
+    _, err := conn.Write(buf[:])
     return err
 }
 
 func ReadHandshakeResponse(conn net.Conn, timeout time.Duration) (byte, error) {
+    if timeout <= 0 {
+        return 0, fmt.Errorf("timeout must be > 0")
+    }
     conn.SetReadDeadline(time.Now().Add(timeout))
     defer conn.SetReadDeadline(time.Time{})
     var resp [2]byte
@@ -51,7 +69,7 @@ func ReadHandshakeResponse(conn net.Conn, timeout time.Duration) (byte, error) {
         return 0, err
     }
     if resp[0] != constants.HandshakeResp {
-        return 0, io.ErrUnexpectedEOF
+        return 0, ErrInvalidHandshake
     }
     return resp[1], nil
 }
