@@ -4,6 +4,7 @@ import (
     "encoding/hex"
     "encoding/json"
     "fmt"
+    "log"
     "os"
     "strings"
     "time"
@@ -11,6 +12,8 @@ import (
     "proxy/internal/constants"
 )
 
+// CommonConfig 包含客户端和服务器共用的配置项。
+// 注意：time.Duration 类型的字段在 JSON 中应使用字符串格式，如 "10s"。
 type CommonConfig struct {
     DialTimeout     time.Duration `json:"dial_timeout"`
     KeepAlive       time.Duration `json:"keep_alive_interval"`
@@ -103,6 +106,9 @@ func LoadServerConfig(path string) error {
             return fmt.Errorf("UUID %s length mismatch", s)
         }
         c.AuthUUIDBin = append(c.AuthUUIDBin, b)
+    }
+    if len(c.AuthUUIDBin) == 0 {
+        log.Println("[警告] AuthUUIDs 为空，服务器将拒绝所有连接")
     }
     ServerConf = &c
     return nil
